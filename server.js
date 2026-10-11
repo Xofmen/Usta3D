@@ -1,195 +1,96 @@
 const express = require('express');
 const TelegramBot = require('node-telegram-bot-api');
-const cors = require('cors');
-const fs = require('fs');
 const path = require('path');
-const { execSync } = require('child_process');
 
 const app = express();
-app.use(cors());
 app.use(express.json());
+app.use(express.static(path.join(__dirname, 'public')));
 
-// Auto-build frontend on startup if dist folder is missing (fixes Render runtime missing dist)
-const distPath = path.join(__dirname, 'dist');
-if (!fs.existsSync(path.join(distPath, 'index.html'))) {
-  console.log('Frontend build not found. Running npm run build...');
-  try {
-    execSync('npm run build', { stdio: 'inherit' });
-    console.log('Frontend built successfully on startup!');
-  } catch (err) {
-    console.error('Failed to build frontend automatically:', err);
-  }
-}
+const PORT = process.env.PORT || 10000;
+const BOT_TOKEN = process.env.BOT_TOKEN;
+const ADMIN_CHAT_ID = process.env.ADMIN_CHAT_ID;
+const WEB_APP_URL = process.env.WEB_APP_URL || 'https://usta3d.onrender.com';
 
-const CONFIG_FILE = path.join(__dirname, 'config.json');
-const ORDERS_FILE = path.join(__dirname, 'orders.json');
-
-let config = {
-  botToken: process.env.BOT_TOKEN || '',
-  adminChatId: process.env.ADMIN_CHAT_ID || ''
-};
-
-if (fs.existsSync(CONFIG_FILE)) {
-  try {
-    const saved = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8'));
-    config = { ...config, ...saved };
-  } catch (e) {}
-}
-
-let orders = [];
-if (fs.existsSync(ORDERS_FILE)) {
-  try {
-    orders = JSON.parse(fs.readFileSync(ORDERS_FILE, 'utf8'));
-  } catch (e) {}
-}
-
-const saveOrders = () => {
-  fs.writeFileSync(ORDERS_FILE, JSON.stringify(orders, null, 2), 'utf8');
-};
-
-const saveConfig = () => {
-  fs.writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2), 'utf8');
-};
+// Хранилище статусов в памяти процесса (для обратной связи)
+const memoryOrders = {};
 
 let bot = null;
-const initBot = (token) => {
-  if (!token) return;
-  try {
-    if (bot) {
-      bot.stopPolling();
-    }
-    bot = new TelegramBot(token, { polling: true });
+if (BOT_TOKEN) {
+    try {
+        bot = new TelegramBot(BOT_TOKEN, { polling: true });
+        console.log('Telegram bot initialized successfully.');
 
-    bot.onText(/\/start/, (msg) => {
-      const chatId = msg.chat.id;
-      bot.sendMessage(chatId, "🛠 Добро пожаловать в USTA 3D! Нажмите кнопку ниже, чтобы открыть каталог и сделать заказ:", {
-        reply_markup: {
-          inline_keyboard: [
-            [
-              { text: "🚀 Открыть USTA 3D", web_app: { url: process.env.WEB_APP_URL || "https://usta-3d.onrender.com" } }
-            ]
-          ]
-        }
-      });
-    });
-
-    bot.on('callback_query', async (query) => {
-      const data = query.data;
-      const chatId = query.message.chat.id;
-      const messageId = query.message.message_id;
-
-      if (data.startsWith('accept_')) {
-        const orderId = Number(data.replace('accept_', ''));
-        const order = orders.find(o => o.id === orderId);
-
-        if (order) {
-          order.status = 'Принят в работу';
-          saveOrders();
-
-          const originalText = query.message.text || '';
-          const cleanText = originalText.replace(/🟡.*$/, '').trim();
-
-          try {
-            await bot.editMessageText(cleanText + '\n\n🟢 *Статус: Принят в работу*', {
-              chat_id: chatId,
-              message_id: messageId,
-              parse_mode: 'Markdown',
-              reply_markup: { inline_keyboard: [] }
+        bot.onText(/\/start/, (msg) => {
+            bot.sendMessage(msg.chat.id, 'Добро пожаловать в USTA 3D Store! 🚀', {
+                reply_markup: {
+                    inline_keyboard: [[
+                        { text: '🚀 Открыть USTA 3D', web_app: { url: WEB_APP_URL } }
+                    ]]
+                }
             });
-            await bot.answerCallbackQuery(query.id, { text: 'Заказ принят в работу!' });
-          } catch (err) {
-            console.error('Error updating telegram message:', err);
-          }
-        }
-      }
-    });
+        });
 
-    console.log('Telegram bot initialized successfully.');
-  } catch (e) {
-    console.error('Failed to initialize bot:', e);
-  }
-};
+        bot.on('callback_query', async (query) => {
+            const data = query.data;
+            if (data.startsWith('accept_')) {
+                const orderId = data.replace('accept_', '');
+                memoryOrders[orderId] = { status: 'accepted', statusText: '🟢 Принят в работу' };
 
-if (config.botToken) {
-  initBot(config.botToken);
+                await bot.answerCallbackQuery(query.id, { text: 'Заказ принят в работу!' });
+                await bot.editMessageText(`${query.message.text}\n\n✅ **СТАТУС: Принят в работу**`, {
+                    chat_id: query.message.chat.id,
+                    message_id: query.message.message_id,
+                    parse_mode: 'Markdown'
+                });
+            }
+        });
+    } catch (e) {
+        console.error('Ошибка инициализации бота:', e.message);
+    }
 }
 
-app.get('/api/orders', (req, res) => {
-  const userId = req.query.userId;
-  if (!userId || userId === 'guest') {
-    return res.json(orders);
-  }
-  const userOrders = orders.filter(o => String(o.userId) === String(userId));
-    res.json(userOrders);
-});
+// Эндпоинт отправки нового заказа
+app.post('/api/order', async (req, res) => {
+    const { id, total, contact, items } = req.body;
+    
+    memoryOrders[id] = { status: 'pending', statusText: '⏳ Ожидает подтверждения' };
 
-app.post('/api/orders', async (req, res) => {
-  const newOrder = req.body;
-  orders.unshift(newOrder);
-  saveOrders();
+    if (bot && ADMIN_CHAT_ID) {
+        const messageText = `🛒 **НОВЫЙ ЗАКАЗ №${id}**\n\n` +
+            `👤 Контакт: ${contact}\n` +
+            `💰 Сумма: ${total} сум\n` +
+            `📦 Состав: ${items.join(', ')}`;
 
-  if (bot && config.adminChatId) {
-    try {
-      const itemsList = newOrder.items.map(i => {
-        const title = typeof i.title === 'object' ? (i.title.ru || i.title.uz) : i.title;
-        return `- ${title} (x${i.qty}) — ${(i.price * i.qty).toLocaleString()} сум`;
-      }).join('\n');
-
-      const deliveryInfo = req.body.deliveryMode === 'yandex' 
-        ? `🚕 Яндекс Доставка: ${newOrder.deliveryAddress}` 
-        : `📦 BTS Express (${newOrder.btsRegion}): ${newOrder.btsBranch}`;
-
-      const text = `🔥 *НОВЫЙ ЗАКАЗ #${newOrder.id}*\n\n` +
-                   `👤 *Имя:* ${newOrder.name}\n` +
-                   `📞 *Телефон:* ${newOrder.phone}\n` +
-                   `${deliveryInfo}\n` +
-                   `💳 *Оплата:* ${newOrder.paymentMethod.toUpperCase()}\n\n` +
-                   `🛒 *Товары:*\n${itemsList}\n\n` +
-                   `💰 *Итого:* *${newOrder.total.toLocaleString()} сум*\n` +
-                   `📅 *Дата:* ${newOrder.date}\n` +
-                   `🟡 *Статус: Заявка отправлена*`;
-
-      await bot.sendMessage(config.adminChatId, text, {
-        parse_mode: 'Markdown',
-        reply_markup: {
-          inline_keyboard: [
-            [
-              { text: '✅ Принять в работу', callback_data: `accept_${newOrder.id}` }
-            ]
-          ]
+        try {
+            await bot.sendMessage(ADMIN_CHAT_ID, messageText, {
+                parse_mode: 'Markdown',
+                reply_markup: {
+                    inline_keyboard: [[
+                        { text: '✅ Принять в работу', callback_data: `accept_${id}` }
+                    ]]
+                }
+            });
+        } catch (err) {
+            console.error('Ошибка отправки сообщения в Telegram:', err.message);
         }
-      });
-    } catch (err) {
-      console.error('Telegram notification error:', err);
     }
-  }
-
-  res.json({ success: true, order: newOrder });
+    res.json({ success: true, orderId: id });
 });
 
-app.post('/api/config', (req, res) => {
-  const { botToken, adminChatId } = req.body;
-  if (botToken) config.botToken = botToken;
-  if (adminChatId) config.adminChatId = adminChatId;
-  saveConfig();
-  if (botToken) {
-    initBot(botToken);
-  }
-  res.json({ success: true });
+// Эндпоинт проверки статусов
+app.post('/api/check-orders', (req, res) => {
+    const { ids } = req.body;
+    const result = {};
+    if (Array.isArray(ids)) {
+        ids.forEach(id => {
+            if (memoryOrders[id]) {
+                result[id] = memoryOrders[id];
+            }
+        });
+    }
+    res.json(result);
 });
 
-// Serve static frontend
-app.use(express.static(distPath));
-app.get('*', (req, res) => {
-  const indexFile = path.join(distPath, 'index.html');
-  if (fs.existsSync(indexFile)) {
-    res.sendFile(indexFile);
-  } else {
-    res.status(404).send('App is building or built files not found.');
-  }
-});
-
-const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
+    console.log(`Server running on port ${PORT}`);
 });
